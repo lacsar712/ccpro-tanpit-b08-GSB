@@ -39,3 +39,8 @@ class LiquorSample(models.Model):
     taken_at = models.DateTimeField(auto_now_add=True)
     ph = models.FloatField()
     operator = models.CharField(max_length=64, blank=True)
+    voided_at = models.DateTimeField(null=True, blank=True)
+
+    @property
+    def is_void(self) -> bool:
+        return self.voided_at is not None
