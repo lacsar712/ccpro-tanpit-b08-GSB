@@ -1,9 +1,19 @@
+import math
+
+from django.db import transaction
 from ninja import NinjaAPI, Schema
 from ninja.errors import HttpError
 
 from pits.auth import BearerAuth, make_token
 from pits.models import Pit, User, Yard
-from pits.rules import RuleError, assert_can_set_status, latest_ph
+from pits.rules import (
+    RuleError,
+    assert_can_set_status,
+    find_race_conflict,
+    latest_ph,
+    ph_mean,
+    sample_count,
+)
 
 api = NinjaAPI(title="TanPit", urls_namespace="tanpit")
 auth = BearerAuth()
@@ -23,6 +33,7 @@ class StatusIn(Schema):
 
 
 def pit_json(pit: Pit) -> dict:
+    """坑位序列化：贴片（latestPh）与均值（meanPh）出自同一批未作废记录。"""
     return {
         "id": pit.id,
         "code": pit.code,
@@ -30,8 +41,16 @@ def pit_json(pit: Pit) -> dict:
         "row": pit.row,
         "col": pit.col,
         "latestPh": latest_ph(pit),
-        "sampleCount": pit.samples.count(),
+        "meanPh": ph_mean(pit),
+        "sampleCount": sample_count(pit),
     }
+
+
+def yard_or_404() -> Yard:
+    yard = Yard.objects.prefetch_related("pits__samples").first()
+    if yard is None:
+        raise HttpError(404, "尚无鞣场")
+    return yard
 
 
 @api.post("/auth/login")
@@ -55,20 +74,31 @@ def health(request):
 
 @api.get("/board", auth=auth)
 def board(request):
-    yard = Yard.objects.prefetch_related("pits__samples").first()
-    if yard is None:
-        raise HttpError(404, "尚无鞣场")
+    yard = yard_or_404()
+    pits = sorted(yard.pits.all(), key=lambda p: (p.row, p.col))
+    return {"yard": yard.name, "village": yard.village, "pits": [pit_json(p) for p in pits]}
+
+
+@api.get("/ph-means", auth=auth)
+def ph_means(request):
+    """酸碱均值专页：按坑列出全部未作废记录的算术平均，无记录则为空。"""
+    yard = yard_or_404()
     pits = sorted(yard.pits.all(), key=lambda p: (p.row, p.col))
     return {"yard": yard.name, "village": yard.village, "pits": [pit_json(p) for p in pits]}
 
 
 @api.post("/pits/{pit_id}/samples", auth=auth)
 def add_sample(request, pit_id: int, payload: SampleIn):
-    pit = Pit.objects.filter(id=pit_id).first()
-    if pit is None:
-        raise HttpError(404, "坑不存在")
-    pit.samples.create(ph=payload.ph, operator=request.auth.username)
-    pit.refresh_from_db()
+    if not math.isfinite(payload.ph):
+        raise HttpError(400, "酸碱度必须是有限数值")
+    with transaction.atomic():
+        # 锁住该坑行：两名工抢登同一坑时排队，后到者见已有记录即拒，只入一条
+        pit = Pit.objects.select_for_update().filter(id=pit_id).first()
+        if pit is None:
+            raise HttpError(404, "坑不存在")
+        if find_race_conflict(pit, request.auth.username) is not None:
+            raise HttpError(409, "该坑刚登记过一条酸碱，抢着登记只入一条，请稍后再试")
+        pit.samples.create(ph=payload.ph, operator=request.auth.username)
     return pit_json(pit)
 
 

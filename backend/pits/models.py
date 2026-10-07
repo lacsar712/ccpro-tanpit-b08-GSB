@@ -39,3 +39,5 @@ class LiquorSample(models.Model):
     taken_at = models.DateTimeField(auto_now_add=True)
     ph = models.FloatField()
     operator = models.CharField(max_length=64, blank=True)
+    # 作废的记录不进贴片、不进均值、不算放液依据
+    voided = models.BooleanField(default=False)
